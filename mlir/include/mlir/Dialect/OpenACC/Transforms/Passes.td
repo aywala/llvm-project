@@ -111,6 +111,116 @@ def ACCImplicitDeclare : Pass<"acc-implicit-declare", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::acc::OpenACCDialect"];
 }
 
+def ACCImplicitLoopPrivate : Pass<"acc-implicit-loop-private", "mlir::ModuleOp"> {
+  let summary = "Add implicit private clauses to scalar variables in acc loop constructs";
+  let description = [{
+    This pass adds implicit `private` clauses to `acc.loop` constructs for
+    scalar variables that are already privatized in an enclosing construct.
+
+    Per the OpenACC specification, `firstprivate` clauses are only valid on
+    compute constructs (`acc.parallel`, `acc.serial`, `acc.kernels`), not on
+    `acc.loop`. This pass assumes that scalar variables have already been mapped
+    with `firstprivate` on an enclosing `acc.parallel` (or with `private` on
+    an enclosing `acc.loop`), and adds a corresponding `private` clause to the
+    `acc.loop` that uses the enclosing construct's privatized value as the
+    initial source.
+
+    Specifically, for each scalar value that is live-in to an `acc.loop` region
+    and is the result of an `acc.firstprivate` or `acc.private` operation from
+    an enclosing construct, the pass:
+
+    1. Creates an `acc.private` operation before the `acc.loop`, with `varPtr`
+       set to the enclosing construct's firstprivate or private result. This
+       initializes the loop-private copy from the enclosing-level value.
+    2. Creates (or reuses) an `acc.private.recipe` symbol derived from the
+       corresponding `acc.firstprivate.recipe` for the variable's type.
+    3. Adds the new `acc.private` result to the `acc.loop`'s `privateOperands`.
+    4. Replaces all uses of the enclosing value inside the loop with the
+       new private result.
+
+    The pass processes loops in pre-order so that, for nested loops, the outer
+    loop's private result is available as the inner loop's source.
+
+    Requirements:
+    - Scalar variables must implement `acc::MappableType` or
+      `acc::PointerLikeType` so that the pass can determine the type category
+      and generate the appropriate recipe.
+    - An enclosing `acc.parallel` (or `acc.loop`) must already have the scalar
+      covered by `firstprivate` (or `private`). This pass is meant to run
+      after `acc-implicit-data` or similar passes that add those clauses.
+
+    Example (parallel enclosing loop):
+
+    ```mlir
+    // Before (scalar %fp is firstprivate on acc.parallel):
+    %fp = acc.firstprivate varPtr(%n : memref<i32>)
+            recipe(@fp_recipe) -> memref<i32>
+    acc.parallel firstprivate(%fp : memref<i32>) {
+      acc.loop control(%iv : i32) = (%c0 : i32) to (%c10 : i32)
+                                    step (%c1 : i32) {
+        %val = memref.load %fp[] : memref<i32>  // %fp live-in to loop
+        acc.yield
+      } attributes {independent = [#acc.device_type<none>]}
+      acc.yield
+    }
+
+    // After:
+    %fp = acc.firstprivate varPtr(%n : memref<i32>)
+            recipe(@fp_recipe) -> memref<i32>
+    acc.parallel firstprivate(%fp : memref<i32>) {
+      %lp = acc.private varPtr(%fp : memref<i32>)
+              recipe(@priv_from_fp_recipe) -> memref<i32>
+              {implicit = true, name = "n"}
+      acc.loop private(%lp : memref<i32>)
+               control(%iv : i32) = (%c0 : i32) to (%c10 : i32)
+                                     step (%c1 : i32) {
+        %val = memref.load %lp[] : memref<i32>
+        acc.yield
+      } attributes {independent = [#acc.device_type<none>]}
+      acc.yield
+    }
+    ```
+
+    Example (nested loops):
+
+    ```mlir
+    // Before (outer loop has private for scalar from enclosing parallel):
+    acc.parallel firstprivate(%fp : memref<i32>) {
+      %outerPriv = acc.private varPtr(%fp : memref<i32>)
+                     recipe(@priv_recipe) -> memref<i32>
+      acc.loop private(%outerPriv : memref<i32>) control(%i : i32) = ... {
+        acc.loop control(%j : i32) = ... {
+          %val = memref.load %outerPriv[] : memref<i32>  // live-in to inner loop
+          acc.yield
+        } attributes {independent = [#acc.device_type<none>]}
+        acc.yield
+      } attributes {independent = [#acc.device_type<none>]}
+      acc.yield
+    }
+
+    // After:
+    acc.parallel firstprivate(%fp : memref<i32>) {
+      %outerPriv = acc.private varPtr(%fp : memref<i32>)
+                     recipe(@priv_recipe) -> memref<i32>
+      acc.loop private(%outerPriv : memref<i32>) control(%i : i32) = ... {
+        %innerPriv = acc.private varPtr(%outerPriv : memref<i32>)
+                       recipe(@priv_recipe) -> memref<i32>
+                       {implicit = true, name = "n"}
+        acc.loop private(%innerPriv : memref<i32>) control(%j : i32) = ... {
+          %val = memref.load %innerPriv[] : memref<i32>
+          acc.yield
+        } attributes {independent = [#acc.device_type<none>]}
+        acc.yield
+      } attributes {independent = [#acc.device_type<none>]}
+      acc.yield
+    }
+    ```
+  }];
+  let dependentDialects = ["mlir::acc::OpenACCDialect",
+      "mlir::memref::MemRefDialect",
+      "mlir::arith::ArithDialect"];
+}
+
 def ACCImplicitRoutine : Pass<"acc-implicit-routine", "mlir::ModuleOp"> {
   let summary = "Generate implicit acc routine for functions in acc regions";
   let description = [{
