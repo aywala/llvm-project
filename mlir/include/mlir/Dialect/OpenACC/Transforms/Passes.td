@@ -111,6 +111,67 @@ def ACCImplicitDeclare : Pass<"acc-implicit-declare", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::acc::OpenACCDialect"];
 }
 
+def ACCImplicitLoopPrivate : Pass<"acc-implicit-loop-private", "mlir::ModuleOp"> {
+  let summary = "Add implicit private clauses to scalar variables in acc loop constructs";
+  let description = [{
+    This pass adds implicit privatization for scalar variables used inside
+    `acc.loop` constructs that do not already have explicit private,
+    firstprivate, or reduction clauses.
+
+    For each scalar variable that is live-in to an `acc.loop` region and is
+    not already covered by a private, firstprivate, or reduction clause, the
+    pass generates an `acc.firstprivate` operation that initializes the private
+    copy from the value in the enclosing scope. This ensures that each loop
+    iteration operates on a private copy of the scalar that is initialized with
+    the value from the upper level (i.e., firstprivate semantics).
+
+    The pass also creates the necessary `acc.firstprivate.recipe` symbol in
+    the module for each privatized type.
+
+    Requirements:
+    - Variables must implement `acc::MappableType` or `acc::PointerLikeType`
+      so that the pass can determine their type category (scalar vs. aggregate)
+      and generate the appropriate recipe.
+
+    Example:
+
+    ```mlir
+    // Before:
+    func.func @test() {
+      %n = memref.alloca() {acc.var_name = "n"} : memref<i32>
+      acc.parallel {
+        acc.loop control(%iv : i32) = (%c0 : i32) to (%c10 : i32)
+                                      step (%c1 : i32) {
+          %val = memref.load %n[] : memref<i32>
+          acc.yield
+        } attributes {independent = [#acc.device_type<none>]}
+        acc.yield
+      }
+    }
+
+    // After:
+    func.func @test() {
+      %n = memref.alloca() {acc.var_name = "n"} : memref<i32>
+      acc.parallel {
+        %fp = acc.firstprivate varPtr(%n : memref<i32>)
+                recipe(@firstprivate_memref_i32) -> memref<i32>
+                {implicit = true, name = "n"}
+        acc.loop firstprivate(%fp : memref<i32>)
+                 control(%iv : i32) = (%c0 : i32) to (%c10 : i32)
+                                      step (%c1 : i32) {
+          %val = memref.load %fp[] : memref<i32>
+          acc.yield
+        } attributes {independent = [#acc.device_type<none>]}
+        acc.yield
+      }
+    }
+    ```
+  }];
+  let dependentDialects = ["mlir::acc::OpenACCDialect",
+      "mlir::memref::MemRefDialect",
+      "mlir::arith::ArithDialect"];
+}
+
 def ACCImplicitRoutine : Pass<"acc-implicit-routine", "mlir::ModuleOp"> {
   let summary = "Generate implicit acc routine for functions in acc regions";
   let description = [{
